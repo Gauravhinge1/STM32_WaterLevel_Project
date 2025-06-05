@@ -1,0 +1,647 @@
+////this is the complete code for the water level monitoring system
+/* Includes ------------------------------------------------------------------*/
+#include "stm32f1xx_hal.h"
+#include "cmsis_os.h"
+#include <string.h>
+#include <stdio.h>
+
+/* --- Defines --- */
+#define MOTOR_PIN       GPIO_PIN_0
+#define MOTOR_PORT      GPIOB
+
+#define BUZZER_PIN      GPIO_PIN_1
+#define BUZZER_PORT     GPIOB
+
+#define WATER_LOW_PIN   GPIO_PIN_10
+#define WATER_UPPER_PIN GPIO_PIN_11
+#define WATER_PORT      GPIOA
+
+/* LCD pins */
+#define LCD_RS_PIN      GPIO_PIN_0
+#define LCD_EN_PIN      GPIO_PIN_1
+#define LCD_D4_PIN      GPIO_PIN_2
+#define LCD_D5_PIN      GPIO_PIN_3
+#define LCD_D6_PIN      GPIO_PIN_4
+#define LCD_D7_PIN      GPIO_PIN_5
+#define LCD_PORT        GPIOB
+
+/* Keypad pins - Rows and Columns */
+#define KEYPAD_ROW0_PIN GPIO_PIN_6
+#define KEYPAD_ROW1_PIN GPIO_PIN_7
+#define KEYPAD_ROW2_PIN GPIO_PIN_8
+#define KEYPAD_ROW3_PIN GPIO_PIN_9
+#define KEYPAD_COL0_PIN GPIO_PIN_12
+#define KEYPAD_COL1_PIN GPIO_PIN_13
+#define KEYPAD_COL2_PIN GPIO_PIN_14
+#define KEYPAD_COL3_PIN GPIO_PIN_15
+#define KEYPAD_ROW_PORT GPIOB
+#define KEYPAD_COL_PORT GPIOB
+
+#define PASSWORD "0000"
+#define PASSWORD_LENGTH 4
+
+/* EEPROM emulation with RTC backup registers */
+#define EEPROM_CLEANING_HOUR_REG     RTC_BKP_DR1
+#define EEPROM_CLEANING_MIN_REG      RTC_BKP_DR2
+#define EEPROM_WATER_LEVEL_THRESH_REG RTC_BKP_DR3
+
+/* FreeRTOS handles */
+osThreadId_t waterLevelTaskHandle;
+osThreadId_t motorTaskHandle;
+osThreadId_t lcdTaskHandle;
+osThreadId_t keypadTaskHandle;
+osTimerId_t cleaningTimerHandle;
+
+osSemaphoreId_t motorSemaphoreHandle;
+osMessageQueueId_t lcdQueueHandle;
+
+/* RTC handle */
+RTC_HandleTypeDef hrtc;
+
+/* --- Variables --- */
+typedef struct {
+    uint8_t cleaningHour;    // 0-23
+    uint8_t cleaningMinute;  // 0-59
+    uint8_t waterLevelThreshold;  // 0 or 1 (for probe)
+} UserSettings_t;
+
+UserSettings_t settings;
+
+char lcdLine1[17];
+char lcdLine2[17];
+
+uint8_t motorRunning = 0;
+
+/* --- Prototypes --- */
+void SystemClock_Config(void);
+void MX_GPIO_Init(void);
+void MX_RTC_Init(void);
+void LCD_Init(void);
+void LCD_SendCommand(uint8_t cmd);
+void LCD_SendData(uint8_t data);
+void LCD_SendString(char *str);
+void LCD_Clear(void);
+void LCD_SetCursor(uint8_t row, uint8_t col);
+void Motor_On(void);
+void Motor_Off(void);
+void Buzzer_On(void);
+void Buzzer_Off(void);
+uint8_t WaterLevel_ReadLower(void);
+uint8_t WaterLevel_ReadUpper(void);
+char Keypad_GetKey(void);
+uint8_t Keypad_CheckPassword(void);
+void LoadSettings(void);
+void SaveSettings(void);
+void CheckCleaningSchedule(void);
+void StartWaterLevelTask(void *argument);
+void StartMotorTask(void *argument);
+void StartLCDTask(void *argument);
+void StartKeypadTask(void *argument);
+void CleaningTimerCallback(void *argument);
+
+/* --- Main --- */
+int main(void)
+{
+    HAL_Init();
+    SystemClock_Config();
+    MX_GPIO_Init();
+    MX_RTC_Init();
+    LCD_Init();
+    LCD_Clear();
+
+    Motor_Off();
+    Buzzer_Off();
+
+    LoadSettings();
+
+    motorSemaphoreHandle = osSemaphoreNew(1, 0, NULL);
+    lcdQueueHandle = osMessageQueueNew(5, sizeof(char[32]), NULL);
+
+    waterLevelTaskHandle = osThreadNew(StartWaterLevelTask, NULL, NULL);
+    motorTaskHandle = osThreadNew(StartMotorTask, NULL, NULL);
+    lcdTaskHandle = osThreadNew(StartLCDTask, NULL, NULL);
+    keypadTaskHandle = osThreadNew(StartKeypadTask, NULL, NULL);
+
+    cleaningTimerHandle = osTimerNew(CleaningTimerCallback, osTimerOnce, NULL, NULL);
+
+    osKernelStart();
+
+    while(1) {}
+}
+
+/* --- Load/Save Settings in RTC Backup Registers --- */
+void LoadSettings(void)
+{
+    uint32_t val;
+
+    val = HAL_RTCEx_BKUPRead(&hrtc, EEPROM_CLEANING_HOUR_REG);
+    settings.cleaningHour = (val <= 23) ? val : 12;  // default 12
+    val = HAL_RTCEx_BKUPRead(&hrtc, EEPROM_CLEANING_MIN_REG);
+    settings.cleaningMinute = (val <= 59) ? val : 0;
+    val = HAL_RTCEx_BKUPRead(&hrtc, EEPROM_WATER_LEVEL_THRESH_REG);
+    settings.waterLevelThreshold = (val == 0 || val == 1) ? val : 1;  // default 1 (water present)
+}
+
+void SaveSettings(void)
+{
+    HAL_RTCEx_BKUPWrite(&hrtc, EEPROM_CLEANING_HOUR_REG, settings.cleaningHour);
+    HAL_RTCEx_BKUPWrite(&hrtc, EEPROM_CLEANING_MIN_REG, settings.cleaningMinute);
+    HAL_RTCEx_BKUPWrite(&hrtc, EEPROM_WATER_LEVEL_THRESH_REG, settings.waterLevelThreshold);
+}
+
+/* --- Check if cleaning schedule time matches RTC time --- */
+void CheckCleaningSchedule(void)
+{
+    RTC_TimeTypeDef time;
+    HAL_RTC_GetTime(&hrtc, &time, RTC_FORMAT_BIN);
+
+    if(time.Hours == settings.cleaningHour && time.Minutes == settings.cleaningMinute && motorRunning == 0)
+    {
+        osSemaphoreRelease(motorSemaphoreHandle);
+    }
+}
+
+/* --- Tasks --- */
+void StartWaterLevelTask(void *argument)
+{
+    char msg[32];
+    while(1)
+    {
+        uint8_t lower = WaterLevel_ReadLower();
+        uint8_t upper = WaterLevel_ReadUpper();
+
+        snprintf(msg, sizeof(msg), "L:%d U:%d Th:%d", lower, upper, settings.waterLevelThreshold);
+        osMessageQueuePut(lcdQueueHandle, msg, 0, 0);
+
+        // Buzzer and motor logic
+        if(lower < settings.waterLevelThreshold && upper < settings.waterLevelThreshold)
+        {
+            Buzzer_On();
+            osSemaphoreRelease(motorSemaphoreHandle);
+        }
+        else
+        {
+            Buzzer_Off();
+        }
+
+        CheckCleaningSchedule();
+
+        osDelay(2000);
+    }
+}
+
+void StartMotorTask(void *argument)
+{
+    while(1)
+    {
+        if(osSemaphoreAcquire(motorSemaphoreHandle, osWaitForever) == osOK)
+        {
+            motorRunning = 1;
+            Motor_On();
+            Buzzer_On();
+            osDelay(10000);
+            Motor_Off();
+            Buzzer_Off();
+            motorRunning = 0;
+        }
+        osDelay(100);
+    }
+}
+
+void StartLCDTask(void *argument)
+{
+    char msg[32];
+    LCD_Clear();
+    LCD_SetCursor(0,0);
+    LCD_SendString("Water Level Sys");
+
+    while(1)
+    {
+        if(osMessageQueueGet(lcdQueueHandle, msg, NULL, osWaitForever) == osOK)
+        {
+            LCD_Clear();
+            LCD_SetCursor(0,0);
+            LCD_SendString(msg);
+
+            // Show cleaning schedule on line 2
+            snprintf(lcdLine2, sizeof(lcdLine2), "Clean %02d:%02d  Th:%d",
+                    settings.cleaningHour, settings.cleaningMinute, settings.waterLevelThreshold);
+            LCD_SetCursor(1,0);
+            LCD_SendString(lcdLine2);
+        }
+        osDelay(500);
+    }
+}
+
+void StartKeypadTask(void *argument)
+{
+    uint8_t settingStep = 0;  // 0 = no set, 1 = hour, 2 = min, 3 = threshold
+    char input[3] = {0};
+    uint8_t inputPos = 0;
+    uint8_t accessGranted = 0;
+
+    while(1)
+    {
+        if(!accessGranted)
+        {
+            LCD_Clear();
+            LCD_SetCursor(0,0);
+            LCD_SendString("Enter Password:");
+
+            if(Keypad_CheckPassword())
+            {
+                accessGranted = 1;
+                LCD_Clear();
+                LCD_SetCursor(0,0);
+                LCD_SendString("Access Granted");
+                HAL_Delay(1000);
+                settingStep = 1;
+
+                LCD_Clear();
+                LCD_SetCursor(0,0);
+                LCD_SendString("Set Cleaning Hr:");
+                inputPos = 0;
+                memset(input,0,sizeof(input));
+            }
+            else
+            {
+                HAL_Delay(200);
+            }
+        }
+        else
+        {
+            char key = Keypad_GetKey();
+            if(key != 0)
+            {
+                if(key >= '0' && key <= '9' && inputPos < 2)
+                {
+                    input[inputPos++] = key;
+                    LCD_SetCursor(1,0);
+                    LCD_SendString(input);
+                }
+                else if(key == '#')  // submit input
+                {
+                    if(settingStep == 1)
+                    {
+                        uint8_t val = atoi(input);
+                        if(val <= 23)
+                        {
+                            settings.cleaningHour = val;
+                            settingStep++;
+                            inputPos = 0;
+                            memset(input,0,sizeof(input));
+                            LCD_Clear();
+                            LCD_SetCursor(0,0);
+                            LCD_SendString("Set Cleaning Min:");
+                        }
+                        else
+                        {
+                            LCD_Clear();
+                            LCD_SetCursor(0,0);
+                            LCD_SendString("Invalid Hour");
+                            HAL_Delay(1000);
+                            LCD_Clear();
+                            LCD_SetCursor(0,0);
+                            LCD_SendString("Set Cleaning Hr:");
+                        }
+                    }
+                    else if(settingStep == 2)
+                    {
+                        uint8_t val = atoi(input);
+                        if(val <= 59)
+                        {
+                            settings.cleaningMinute = val;
+                            settingStep++;
+                            inputPos = 0;
+                            memset(input,0,sizeof(input));
+                            LCD_Clear();
+                            LCD_SetCursor(0,0);
+                            LCD_SendString("Set Water Level:");
+                            LCD_SetCursor(1,0);
+                            if(settings.waterLevelThreshold == 0) LCD_SendString("LOW");
+                            else LCD_SendString("HIGH");
+                        }
+                        else
+                        {
+                            LCD_Clear();
+                            LCD_SetCursor(0,0);
+                            LCD_SendString("Invalid Min");
+                            HAL_Delay(1000);
+                            LCD_Clear();
+                            LCD_SetCursor(0,0);
+                            LCD_SendString("Set Cleaning Min:");
+                        }
+                    }
+                    else if(settingStep == 3)
+                    {
+                        if(input[0] == '0' || input[0] == '1')
+                        {
+                            settings.waterLevelThreshold = input[0] - '0';
+                            SaveSettings();
+                            settingStep = 0;
+                            accessGranted = 0;
+                            LCD_Clear();
+                            LCD_SetCursor(0,0);
+                            LCD_SendString("Settings Saved");
+                            HAL_Delay(1000);
+                        }
+                        else
+                        {
+                            LCD_Clear();
+                            LCD_SetCursor(0,0);
+                            LCD_SendString("Invalid Value");
+                            HAL_Delay(1000);
+                            LCD_Clear();
+                            LCD_SetCursor(0,0);
+                            LCD_SendString("Set Water Level:");
+                        }
+                    }
+                }
+            }
+            osDelay(100);
+        }
+    }
+}
+
+/* --- Cleaning Timer Callback (not used in this example) --- */
+void CleaningTimerCallback(void *argument)
+{
+    osSemaphoreRelease(motorSemaphoreHandle);
+}
+
+/* --- Water Level Reading --- */
+uint8_t WaterLevel_ReadLower(void)
+{
+    // 1 means water present, 0 means low water
+    return (HAL_GPIO_ReadPin(WATER_PORT, WATER_LOW_PIN) == GPIO_PIN_SET) ? 1 : 0;
+}
+
+uint8_t WaterLevel_ReadUpper(void)
+{
+    return (HAL_GPIO_ReadPin(WATER_PORT, WATER_UPPER_PIN) == GPIO_PIN_SET) ? 1 : 0;
+}
+
+/* --- Motor & Buzzer control --- */
+void Motor_On(void)
+{
+    HAL_GPIO_WritePin(MOTOR_PORT, MOTOR_PIN, GPIO_PIN_SET);
+}
+void Motor_Off(void)
+{
+    HAL_GPIO_WritePin(MOTOR_PORT, MOTOR_PIN, GPIO_PIN_RESET);
+}
+void Buzzer_On(void)
+{
+    HAL_GPIO_WritePin(BUZZER_PORT, BUZZER_PIN, GPIO_PIN_SET);
+}
+void Buzzer_Off(void)
+{
+    HAL_GPIO_WritePin(BUZZER_PORT, BUZZER_PIN, GPIO_PIN_RESET);
+}
+
+/* --- LCD functions (4-bit mode) --- */
+void LCD_EnablePulse(void)
+{
+    HAL_GPIO_WritePin(LCD_PORT, LCD_EN_PIN, GPIO_PIN_SET);
+    HAL_Delay(1);
+    HAL_GPIO_WritePin(LCD_PORT, LCD_EN_PIN, GPIO_PIN_RESET);
+    HAL_Delay(1);
+}
+
+void LCD_SendNibble(uint8_t nibble)
+{
+    HAL_GPIO_WritePin(LCD_PORT, LCD_D4_PIN, (nibble & 0x01) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(LCD_PORT, LCD_D5_PIN, (nibble & 0x02) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(LCD_PORT, LCD_D6_PIN, (nibble & 0x04) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(LCD_PORT, LCD_D7_PIN, (nibble & 0x08) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    LCD_EnablePulse();
+}
+
+void LCD_SendCommand(uint8_t cmd)
+{
+    HAL_GPIO_WritePin(LCD_PORT, LCD_RS_PIN, GPIO_PIN_RESET);
+    LCD_SendNibble(cmd >> 4);
+    LCD_SendNibble(cmd & 0x0F);
+    HAL_Delay(2);
+}
+
+void LCD_SendData(uint8_t data)
+{
+    HAL_GPIO_WritePin(LCD_PORT, LCD_RS_PIN, GPIO_PIN_SET);
+    LCD_SendNibble(data >> 4);
+    LCD_SendNibble(data & 0x0F);
+    HAL_Delay(2);
+}
+
+void LCD_Init(void)
+{
+    HAL_Delay(50);
+    LCD_SendCommand(0x33);
+    LCD_SendCommand(0x32);
+    LCD_SendCommand(0x28);  // 4-bit mode, 2 lines, 5x7 dots
+    LCD_SendCommand(0x0C);  // Display ON, cursor OFF
+    LCD_SendCommand(0x06);  // Entry mode
+    LCD_SendCommand(0x01);  // Clear display
+    HAL_Delay(2);
+}
+
+void LCD_Clear(void)
+{
+    LCD_SendCommand(0x01);
+    HAL_Delay(2);
+}
+
+void LCD_SetCursor(uint8_t row, uint8_t col)
+{
+    uint8_t addr = 0x00;
+    if(row == 0) addr = 0x80 + col;
+    else if(row == 1) addr = 0xC0 + col;
+    LCD_SendCommand(addr);
+}
+
+void LCD_SendString(char *str)
+{
+    while(*str)
+    {
+        LCD_SendData(*str++);
+    }
+}
+
+/* --- Keypad Functions (4x4 matrix) --- */
+const char keypad_map[4][4] = {
+    {'1','2','3','A'},
+    {'4','5','6','B'},
+    {'7','8','9','C'},
+    {'*','0','#','D'}
+};
+
+char Keypad_GetKey(void)
+{
+    for(uint8_t row=0; row<4; row++)
+    {
+        // Set all rows high
+        HAL_GPIO_WritePin(KEYPAD_ROW_PORT, KEYPAD_ROW0_PIN|KEYPAD_ROW1_PIN|KEYPAD_ROW2_PIN|KEYPAD_ROW3_PIN, GPIO_PIN_SET);
+
+        // Pull one row low
+        switch(row)
+        {
+            case 0: HAL_GPIO_WritePin(KEYPAD_ROW_PORT, KEYPAD_ROW0_PIN, GPIO_PIN_RESET); break;
+            case 1: HAL_GPIO_WritePin(KEYPAD_ROW_PORT, KEYPAD_ROW1_PIN, GPIO_PIN_RESET); break;
+            case 2: HAL_GPIO_WritePin(KEYPAD_ROW_PORT, KEYPAD_ROW2_PIN, GPIO_PIN_RESET); break;
+            case 3: HAL_GPIO_WritePin(KEYPAD_ROW_PORT, KEYPAD_ROW3_PIN, GPIO_PIN_RESET); break;
+        }
+
+        // Check columns
+        if(HAL_GPIO_ReadPin(KEYPAD_COL_PORT, KEYPAD_COL0_PIN) == GPIO_PIN_RESET) return keypad_map[row][0];
+        if(HAL_GPIO_ReadPin(KEYPAD_COL_PORT, KEYPAD_COL1_PIN) == GPIO_PIN_RESET) return keypad_map[row][1];
+        if(HAL_GPIO_ReadPin(KEYPAD_COL_PORT, KEYPAD_COL2_PIN) == GPIO_PIN_RESET) return keypad_map[row][2];
+        if(HAL_GPIO_ReadPin(KEYPAD_COL_PORT, KEYPAD_COL3_PIN) == GPIO_PIN_RESET) return keypad_map[row][3];
+    }
+    return 0; // No key
+}
+
+uint8_t Keypad_CheckPassword(void)
+{
+    static char input[PASSWORD_LENGTH + 1] = {0};
+    static uint8_t pos = 0;
+    char key = Keypad_GetKey();
+
+    if(key != 0)
+    {
+        if(key == '#')
+        {
+            input[pos] = '\0';
+            if(strcmp(input, PASSWORD) == 0)
+            {
+                pos = 0;
+                memset(input, 0, sizeof(input));
+                return 1; // password correct
+            }
+            else
+            {
+                pos = 0;
+                memset(input, 0, sizeof(input));
+                return 0; // password wrong
+            }
+        }
+        else if(pos < PASSWORD_LENGTH && key >= '0' && key <= '9')
+        {
+            input[pos++] = key;
+        }
+    }
+    return 0;
+}
+
+/* --- System Clock, GPIO and RTC initialization --- */
+void SystemClock_Config(void)
+{
+    RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+    RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+    // Initializes the CPU, AHB and APB busses clocks
+    RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE|RCC_OSCILLATORTYPE_LSI;
+    RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+    RCC_OscInitStruct.LSIState = RCC_LSI_ON;
+    RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+    RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+    RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL9;
+    if(HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+    {
+        while(1);
+    }
+    // Initializes the CPU, AHB and APB busses clocks
+    RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                                |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+    RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+    RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+    RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+    RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+    if(HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+    {
+        while(1);
+    }
+}
+
+void MX_GPIO_Init(void)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    /* GPIO Ports Clock Enable */
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+
+    /* Motor pin */
+    GPIO_InitStruct.Pin = MOTOR_PIN;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(MOTOR_PORT, &GPIO_InitStruct);
+
+    /* Buzzer pin */
+    GPIO_InitStruct.Pin = BUZZER_PIN;
+    HAL_GPIO_Init(BUZZER_PORT, &GPIO_InitStruct);
+
+    /* Water Level pins - input */
+    GPIO_InitStruct.Pin = WATER_LOW_PIN | WATER_UPPER_PIN;
+    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(WATER_PORT, &GPIO_InitStruct);
+
+    /* LCD Pins */
+    GPIO_InitStruct.Pin = LCD_RS_PIN | LCD_EN_PIN | LCD_D4_PIN | LCD_D5_PIN | LCD_D6_PIN | LCD_D7_PIN;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(LCD_PORT, &GPIO_InitStruct);
+
+    /* Keypad rows as output */
+    GPIO_InitStruct.Pin = KEYPAD_ROW0_PIN | KEYPAD_ROW1_PIN | KEYPAD_ROW2_PIN | KEYPAD_ROW3_PIN;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(KEYPAD_ROW_PORT, &GPIO_InitStruct);
+
+    /* Keypad columns as input with pull-up */
+    GPIO_InitStruct.Pin = KEYPAD_COL0_PIN | KEYPAD_COL1_PIN | KEYPAD_COL2_PIN | KEYPAD_COL3_PIN;
+    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
+    HAL_GPIO_Init(KEYPAD_COL_PORT, &GPIO_InitStruct);
+
+    /* Init all outputs low */
+    HAL_GPIO_WritePin(MOTOR_PORT, MOTOR_PIN, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(BUZZER_PORT, BUZZER_PIN, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(LCD_PORT, LCD_RS_PIN|LCD_EN_PIN|LCD_D4_PIN|LCD_D5_PIN|LCD_D6_PIN|LCD_D7_PIN, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(KEYPAD_ROW_PORT, KEYPAD_ROW0_PIN|KEYPAD_ROW1_PIN|KEYPAD_ROW2_PIN|KEYPAD_ROW3_PIN, GPIO_PIN_SET);
+}
+
+void MX_RTC_Init(void)
+{
+    hrtc.Instance = RTC;
+    hrtc.Init.AsynchPrediv = 0x7F;
+    hrtc.Init.SynchPrediv = 0x00FF;
+    hrtc.Init.HourFormat = RTC_HOURFORMAT_24;
+    if (HAL_RTC_Init(&hrtc) != HAL_OK)
+    {
+        while(1);
+    }
+
+    // Enable Backup access
+    __HAL_RCC_PWR_CLK_ENABLE();
+    HAL_PWR_EnableBkUpAccess();
+
+    // Enable RTC clock
+    __HAL_RCC_RTC_ENABLE();
+
+    // Check if RTC already initialized (check backup register)
+    if(HAL_RTCEx_BKUPRead(&hrtc, 0x00) != 0x32F2)
+    {
+        // Set default time
+        RTC_TimeTypeDef sTime = {0};
+        sTime.Hours = 12;
+        sTime.Minutes = 0;
+        sTime.Seconds = 0;
+        HAL_RTC_SetTime(&hrtc, &sTime, RTC_FORMAT_BIN);
+
+        // Write a marker to backup register
+        HAL_RTCEx_BKUPWrite(&hrtc, 0x00, 0x32F2);
+    }
+}
+
